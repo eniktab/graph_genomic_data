@@ -1,0 +1,73 @@
+S	s1	5	ATGGG
+S	v2_AB	6	ATATAT
+S	v2_R	0	
+S	s3	10	AGAGGAGGCG
+S	v4_BR	1	C
+S	v4_A	1	A
+S	s5	21	ACACACACATCGGGATTTATC
+S	v6_AR	1	G
+S	v6_B	0	
+S	s7	2	GG
+S	v8_AR	2	AT
+S	v8_B	0	
+S	s9	21	TTATCGGGATTTAAAAAAAAA
+S	v10_A	4	GGCG
+S	s11	5	GGCGG
+S	v12_A	1	C
+S	s13	24	GCGGCGGGGCGGCCGATATATATA
+S	v14_B	2	CC
+S	s15	1	T
+S	v16_AR	2	GG
+S	v16_B	2	CC
+S	s17	1	A
+S	v18_AR	2	GG
+S	v18_B	1	T
+S	s19	1	A
+S	v20_AR	2	GG
+S	v20_B	2	CC
+S	s21	1	A
+S	v22_AR	2	AG
+S	v22_B	0	
+S	s23	7	AGGCAGU
+E	*	s1+	v2_AB+	1$	1$	0	0	*
+E	*	s1+	v2_R+	1$	1$	0	0	*
+E	*	v10_A+	s11+	1$	1$	0	0	*
+E	*	v12_A+	s13+	1$	1$	0	0	*
+E	*	s13+	s15+	1$	1$	0	0	*
+E	*	s13+	v14_B+	1$	1$	0	0	*
+E	*	s15+	v16_AR+	1$	1$	0	0	*
+E	*	s15+	v16_B+	1$	1$	0	0	*
+E	*	v16_AR+	s17+	1$	1$	0	0	*
+E	*	v16_B+	s17+	1$	1$	0	0	*
+E	*	s17+	v18_AR+	1$	1$	0	0	*
+E	*	s17+	v18_B+	1$	1$	0	0	*
+E	*	v18_AR+	s19+	1$	1$	0	0	*
+E	*	v18_B+	s19+	1$	1$	0	0	*
+E	*	s19+	v20_AR+	1$	1$	0	0	*
+E	*	s19+	v20_B+	1$	1$	0	0	*
+E	*	v20_AR+	s21+	1$	1$	0	0	*
+E	*	v20_B+	s21+	1$	1$	0	0	*
+E	*	s21+	v22_AR+	1$	1$	0	0	*
+E	*	s21+	v22_B+	1$	1$	0	0	*
+E	*	v22_AR+	s23+	1$	1$	0	0	*
+E	*	v22_B+	s23+	1$	1$	0	0	*
+E	*	v2_AB+	s3+	1$	1$	0	0	*
+E	*	v2_R+	s3+	1$	1$	0	0	*
+E	*	v4_A+	s5+	1$	1$	0	0	*
+E	*	v4_BR+	s5+	1$	1$	0	0	*
+E	*	s3+	v4_A+	1$	1$	0	0	*
+E	*	s3+	v4_BR+	1$	1$	0	0	*
+E	*	s5+	v6_AR+	1$	1$	0	0	*
+E	*	s5+	v6_B+	1$	1$	0	0	*
+E	*	v6_AR+	s7+	1$	1$	0	0	*
+E	*	v6_B+	s7+	1$	1$	0	0	*
+E	*	s7+	v8_AR+	1$	1$	0	0	*
+E	*	s7+	v8_B+	1$	1$	0	0	*
+E	*	v8_AR+	s9+	1$	1$	0	0	*
+E	*	v8_B+	s9+	1$	1$	0	0	*
+E	*	s9+	v10_A+	1$	1$	0	0	*
+E	*	s9+	s11+	1$	1$	0	0	*
+O	hapA_from_toyrefmacro	s1+ v2_AB+ s3+ v4_A+ s5+ v6_AR+ s7+ v8_AR+ s9+ v10_A+ s11+ v12_A+ s13+ s15+ v16_AR+ s17+ v18_AR+ s19+ v20_AR+ s21+ v22_AR+ s23+
+O	hapB_from_toyrefmacro	s1+ v2_AB+ s3+ v4_BR+ s5+ v6_B+ s7+ v8_B+ s9+ s11+ s13+ v14_B+ s15+ v16_B+ s17+ v18_B+ s19+ v20_B+ s21+ v22_B+ s23+
+O	toyrefmacro	s1+ v2_R+ s3+ v4_BR+ s5+ v6_AR+ s7+ v8_AR+ s9+ s11+ s13+ s15+ v16_AR+ s17+ v18_AR+ s19+ v20_AR+ s21+ v22_AR+ s23+
+

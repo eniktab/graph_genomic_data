@@ -1,0 +1,10 @@
+protoc --python_out=. src/proto/graph.proto
+protoc -I ./src/proto --python_out=. src/proto/vg.proto
+python3 src/proto/_test_proto.py
+
+
+
+A program 'example.cpp' can be compiled with the command:
+g++ -std=c++17 -DNDEBUG -O3 [-msse4.2] \
+   -I/home/niktabel/workspace/sandpit/vg/include -L/home/niktabel/workspace/sandpit/vg/lib \
+   example.cpp -lsdsl -ldivsufsort -ldivsufsort64

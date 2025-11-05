@@ -1,0 +1,5 @@
+toyrefmacro	15	25	F1:STR	0	+
+toyrefmacro	25	55	F2:VNTR	0	+
+toyrefmacro	55	65	F3:Homopolymer	0	+
+toyrefmacro	65	85	F4:GC-rich-island	0	+
+toyrefmacro	85	95	F5:Low-complexity	0	+

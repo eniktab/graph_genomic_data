@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""
+HEL (Hierarchical Embedding Localization)
+GPU‑friendly Python scaffold using TensorFlow for embeddings, FAISS (GPU if available) for ANN,
+and Parasail for fast affine-gap alignment. Designed to localize a long query (10–25 kb) within a
+large reference genome, robust to SNPs/indels and reverse complements.
+
+
+Step 1 deliverable:
+- Utilities: reverse complement, chunking, I/O helpers
+- Embedding backend (TF/HuggingFace DNABERT-style, with graceful fallback to a compact TF model)
+- ANN indexer (FAISS GPU if available → FAISS CPU → ScaNN fallback)
+- Hit structure + basic chaining DP (co-linearity + gap penalty)
+- Fine alignment via Parasail (affine gaps)
+- End-to-end HEL.locate() pipeline with pluggable params
+
+
+Dependencies (install):
+pip install tensorflow transformers tokenizers faiss-gpu faiss-cpu scann parasail-python biopython numpy
+
+
+Notes:
+- If faiss-gpu fails, faiss-cpu will be used automatically; if both unavailable, ScaNN is used.
+- For DNABERT/DNA-Transformer TF weights: we try to load via `from_pt=True` (HF can convert PyTorch -> TF weights on the fly).
+- If a suitable HF DNA model is unavailable, we fallback to a lightweight TF CNN over one-hot 6-mer tokens (not ideal, but works out-of-the-box).
+- Parasail is CPU-SIMD (very fast). You *can* swap to WFA-python if desired.
+"""

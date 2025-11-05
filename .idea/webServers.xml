@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="5a7d81ec-1d4c-46a3-9d97-ccfae0342ab4" name="gadi">
+        <fileTransfer rootFolder="/g/data/te53/en9803/workspace/sync/ANU" accessType="SFTP" host="gadi-compute" port="22" sshConfigId="6287cdef-8642-4fce-b5b8-7dd8f03cc27b" sshConfig="en9803@gadi-compute:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="65f1d433-57d3-4efe-b8ab-b31707dcf6ed" name="gadi_login">
+        <fileTransfer rootFolder="/g/data/te53/en9803/workspace/sync/ANU" accessType="SFTP" sshConfigId="6dee9470-655a-4cbf-a6d5-cba6ef09838f" sshConfig="en9803@gadi.nci.org.au:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

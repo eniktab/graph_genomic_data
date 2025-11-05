@@ -1,0 +1,6 @@
+##gff-version 3
+toyrefmacro	manual-annotation	tandem_repeat	16	25	.	+	.	ID=F1;Name=STR;motif=AC;copies=5;note=Expected ACACACACAC;status=MISMATCH
+toyrefmacro	manual-annotation	variable_number_tandem_repeat	26	55	.	+	.	ID=F2;Name=VNTR;motif=TCGGGATTTA;copies=3;note=Motif detected (exact 3x repeat);status=OK
+toyrefmacro	manual-annotation	homopolymer_run	56	65	.	+	.	ID=F3;Name=Homopolymer;motif=A;copies=10;note=Expected AAAAAAAAAA;status=MISMATCH
+toyrefmacro	manual-annotation	GC_rich_region	66	85	.	+	.	ID=F4;Name=GC-rich-island;note=GC%=90.0;status=OK
+toyrefmacro	manual-annotation	low_complexity_region	86	95	.	+	.	ID=F5;Name=Low-complexity;note=ShannonEntropy=1.000 (0..2 max for DNA);status=OK

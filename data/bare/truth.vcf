@@ -1,0 +1,14 @@
+##fileformat=VCFv4.2
+##fileDate=20250902
+##source=synthetic_truth_builder
+##contig=<ID=toyrefmacro,length=109>
+##INFO=<ID=END,Number=1,Type=Integer,Description="End position of the variant (1-based, inclusive)">
+##INFO=<ID=SVTYPE,Number=1,Type=String,Description="Type of structural variant">
+##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="Length of structural variant">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	hapA	hapB
+toyrefmacro	5	shared_INS_ATx3	G	GATATAT	.	PASS	.	GT	1|1	1|1
+toyrefmacro	16	hapA_SNP	C	A	.	PASS	.	GT	1|0	0|0
+toyrefmacro	39	hapB_DEL_40_42	GGAT	G	.	PASS	.	GT	0|0	1|0
+toyrefmacro	70	hapA_DUP_70_74	C	<DUP>	.	PASS	END=74;SVTYPE=DUP;SVLEN=5	GT	1|0	0|0
+toyrefmacro	90	hapB_INV_90_99	A	<INV>	.	PASS	END=99;SVTYPE=INV;SVLEN=10	GT	0|0	1|0

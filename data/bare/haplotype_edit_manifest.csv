@@ -1,0 +1,7 @@
+haplotype,label,type,original_ref_coord,final_hap_coord,details
+hapA,shared_STR_ATx3,INS,6,6-11,INS ATATAT
+hapA,hapA_SNP,SNP,16,22-22,C>A
+hapA,hapA_DUP_70_74,DUP,70-74,81-85,duplicated:CGGCG
+hapB,shared_STR_ATx3,INS,6,6-11,INS ATATAT
+hapB,hapB_DEL_40_42,DEL,40-42,46-45,deleted:GAT
+hapB,hapB_INV_90_99,INV,90-99,96-105,inverted:TATGGAGAGG->CCTCTCCATA

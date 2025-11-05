@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+option cc_enable_arenas = true;
+
+package graph;
+
+// An enum to store nucleotide bases using small numeric codes.
+enum Base {
+  BASE_UNSPECIFIED = 0;
+  BASE_A = 1;
+  BASE_C = 2;
+  BASE_G = 3;
+  BASE_T = 4;
+}
+
+// The graph structure with a top-level attributes map.
+message Graph {
+  repeated Node nodes = 1;
+  repeated Edge edges = 2;
+
+  // Global attributes, e.g. { "creation_date": "2025-02-10", "version": "2.0" }
+  map<string, string> attributes = 3;
+}
+
+// A node in the graph representing a base at a given genomic position
+// or special "START"/"END".
+message Node {
+  string id = 1;      // e.g. "chr1:1000:A" or "START" / "END"
+  Base base = 2;      // e.g. BASE_A, BASE_C, etc.
+
+  // Arbitrary key-value metadata. For example:
+  // { "base_call_quality": "10"}
+  map<string, string> attributes = 3;
+}
+
+// An edge connecting two nodes.
+message Edge {
+  string source = 1;  // id of the source Node
+  string target = 2;  // id of the target Node
+
+  int32 observation_count = 3;        // how many times this edge is observed
+  repeated string individuals = 4;    // which individuals carry this path
+
+  // Arbitrary key-value metadata. For example:
+  // { "genotype_quality_sampleA": "99", "coverage_sampleB": "12" }
+  map<string, string> attributes = 5;
+}
+
