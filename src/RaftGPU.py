@@ -5,7 +5,7 @@ import math
 import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, List, Sequence
 
 
 @dataclass
@@ -21,6 +21,7 @@ class _Manifest:
     files: dict
     fallback_normalized: bool | None
     index_serialized: bool
+    vectors_normalized: bool
 
 
 class RaftGPU:
@@ -36,10 +37,16 @@ class RaftGPU:
     ----------
     __init__(...)
     add(X, metas)
-    search(Q, k=10, return_distances=False)
+    search(Q, k=10) -> (D_cp, I_cp)
     save(dir, include_dataset=True, fallback_embeddings=None) -> dict
     load(dir, metric=None) -> RaftGPU
     dataset_cupy(dtype=None, ensure_row_major=True) -> cupy.ndarray
+
+    Allocator notes
+    ---------------
+    To avoid CUDA misaligned frees when mixing CuPy and cuVS allocations, we by default make CuPy
+    use RMM's allocator if available. This can be disabled with env var `RAFTGPU_DISABLE_AUTO_RMM=1`.
+    You can also call `RaftGPU.configure_memory_pool()` explicitly at process start.
     """
 
     # ---------------- init ----------------
@@ -48,7 +55,6 @@ class RaftGPU:
         dim: int,
         metric: str = "cosine",
         *,
-        # choose build algorithm
         build_algo: str = "nn_descent",  # 'nn_descent' (CAGRA NN-Descent) or 'ivf_pq'
         # NN-Descent knobs
         graph_degree: int = 64,
@@ -59,8 +65,8 @@ class RaftGPU:
         ivf_n_probes: int | None = None,
         ivf_pq_dim: int = 64,
         ivf_pq_bits: int = 8,
-        refinement_rate: float = 2.0,     # candidate multiplier when refine=True
-        refine: bool = False,             # enable exact re-ranking after IVF-PQ search
+        refinement_rate: float = 2.0,  # candidate multiplier when refine=True
+        refine: bool = False,  # enable exact re-ranking after IVF-PQ search
         # Search knob for CAGRA
         search_itopk_size: int = 128,
     ) -> None:
@@ -71,6 +77,20 @@ class RaftGPU:
         self._np = importlib.import_module("numpy")
         self.cagra = importlib.import_module("cuvs.neighbors.cagra")
         self.ivf_pq = importlib.import_module("cuvs.neighbors.ivf_pq")
+
+        # --- Allocator harmonization (avoid CuPy/cuvs mismatch) ---
+        # By default, switch CuPy to use RMM's allocator if available.
+        self._using_rmm_allocator = False
+        if os.environ.get("RAFTGPU_DISABLE_AUTO_RMM", "").strip() not in ("1", "true", "True"):
+            try:
+                import rmm
+                # We don't reinitialize here (respect app-level config).
+                # We only point CuPy at RMM's allocator so both share the same resource.
+                self._cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+                self._using_rmm_allocator = True
+            except Exception:
+                # RMM not present or failed; carry on with CuPy's default allocator.
+                self._using_rmm_allocator = False
 
         # Basic attrs
         self.dim = int(dim)
@@ -94,10 +114,12 @@ class RaftGPU:
 
         # Index+data
         self.index = None  # cuVS index handle
-        self._dataset_cp = None  # CuPy fp32 row-major dataset we built with
-        self._row_norm2 = None   # cached row norms for L2 refinement
+        self._dataset_cp = None  # CuPy fp32 row-major dataset we built with (or wrapped lazily from index.dataset)
+        self._row_norm2 = None  # cached row norms for L2 refinement
         self.metas: List[Any] = []  # Python-side metadata, one per row
 
+        # Track whether vectors in _dataset_cp are already normalized
+        self._vectors_normalized = False
         # Default CAGRA search params (kept immutable for thread-safety)
         self.search_params = self.cagra.SearchParams(itopk_size=int(search_itopk_size))
 
@@ -131,14 +153,7 @@ class RaftGPU:
     def _to_cupy_array(x):
         """Convert RAFT/pylibraft device_ndarray or anything with __cuda_array_interface__ to cupy.ndarray."""
         import cupy as cp
-        try:
-            return cp.asarray(x)
-        except Exception:
-            # Fall back: try .__cuda_array_interface__ via memoryview
-            try:
-                return cp.asarray(memoryview(x))
-            except Exception as e:
-                raise TypeError(f"Cannot convert object of type {type(x)} to CuPy array") from e
+        return cp.asarray(x)
 
     def _as_device_row_major_f32(self, X: Any):
         """
@@ -154,14 +169,13 @@ class RaftGPU:
             from torch.utils.dlpack import to_dlpack
             if isinstance(X, torch.Tensor):
                 if X.device.type == "cuda":
-                    # Move via DLPack to CuPy
                     t = X.detach().contiguous()
                     X_cp = cp.from_dlpack(to_dlpack(t))
                 else:
                     X_cp = cp.asarray(X.detach().cpu().numpy())
             else:
                 X_cp = cp.asarray(np.asarray(X))
-        # CuPy
+        # CuPy or CUDA array interface
         elif hasattr(X, "__cuda_array_interface__"):
             X_cp = cp.asarray(X)
         # NumPy or array-like
@@ -176,10 +190,22 @@ class RaftGPU:
             X_cp = cp.ascontiguousarray(X_cp)
         return X_cp
 
-    def _normalize_inplace_if_cosine(self, A_cp):
-        """If metric is cosine, L2-normalize rows (in-place if possible)."""
+    def _normalize_inplace_if_cosine(self, A_cp, force: bool = False):
+        """
+        If metric is cosine, L2-normalize rows (in-place if possible).
+
+        Args:
+            A_cp: CuPy array to normalize
+            force: If True, normalize regardless of _vectors_normalized flag
+                   (used when normalizing query vectors)
+        """
         if self._metric_name != "inner_product":
             return A_cp
+
+        # Don't double-normalize dataset vectors
+        if not force and self._vectors_normalized and A_cp is self._dataset_cp:
+            return A_cp
+
         cp = self._cp
         norms = cp.linalg.norm(A_cp, axis=1, keepdims=True)
         eps = cp.array(1e-12, dtype=A_cp.dtype)
@@ -187,10 +213,23 @@ class RaftGPU:
         return A_cp
 
     # ---------------- build ----------------
-    def add(self, X: Any, metas: Sequence[Any]) -> None:
+    def add(
+        self,
+        X: Any,
+        metas: Sequence[Any],
+        *,
+        _skip_normalization: bool = False
+    ) -> None:
         """
         Build the index from embeddings X (N x D) and attach metas.
         Accepts NumPy, CuPy, or Torch. Device math only; ensures row-major, fp32.
+
+        Args:
+            X: Embeddings (NumPy, CuPy, Torch)
+            metas: Sequence of metadata, one per row
+            _skip_normalization: (Internal) If True, skip normalization even
+                if metric is cosine. Used by load() when rebuilding from
+                already-normalized vectors.
         """
         if self.index is not None and len(self) > 0:
             raise RuntimeError("Index already built; create a new RaftGPU for another dataset.")
@@ -199,8 +238,13 @@ class RaftGPU:
         if Xg.shape[1] != self.dim:
             raise ValueError(f"X has dim={Xg.shape[1]}, expected {self.dim}")
 
-        # Normalize for cosine
-        Xg = self._normalize_inplace_if_cosine(Xg)
+        # Normalize for cosine, unless explicitly skipped (e.g., by load())
+        if not _skip_normalization:
+            Xg = self._normalize_inplace_if_cosine(Xg, force=True)
+            self._vectors_normalized = (self._metric_name == "inner_product")
+        else:
+            # trusting caller (load()) that vectors are already normalized if cosine
+            self._vectors_normalized = (self._metric_name == "inner_product")
 
         if self._build_algo == "nn_descent":
             # Index & Build params (CAGRA)
@@ -225,8 +269,21 @@ class RaftGPU:
             self.index = self.ivf_pq.build(ip, Xg)
 
         self._dataset_cp = Xg
-        self._row_norm2 = None  # invalidate cached norms (dataset changed)
+        self._precompute_row_norms()  # compute and cache norms after build
         self.metas = list(metas)
+
+    def _precompute_row_norms(self) -> None:
+        """Precompute and cache row norms for L2 distance refinement."""
+        if self._dataset_cp is None:
+            self._row_norm2 = None
+            return
+
+        cp = self._cp
+        # Only compute for L2 metric (for cosine, vectors are unit norm)
+        if self._metric_name != "inner_product":
+            self._row_norm2 = cp.sum(self._dataset_cp * self._dataset_cp, axis=1).astype(cp.float32, copy=False)
+        else:
+            self._row_norm2 = None
 
     # ---------------- dataset exposure ----------------
     def dataset_cupy(self, dtype=None, ensure_row_major=True):
@@ -245,10 +302,14 @@ class RaftGPU:
                 raise RuntimeError("Index has no attached dataset")
             V = self._to_cupy_array(ds)
 
+        # normalize view guarantees
         if ensure_row_major and not V.flags.c_contiguous:
             V = cp.ascontiguousarray(V)
         if dtype is not None and V.dtype != dtype:
             V = V.astype(dtype, copy=False)
+
+        # cache the normalized/correct view to avoid repeating work
+        self._dataset_cp = V
         return V
 
     # ---------------- search ----------------
@@ -262,7 +323,6 @@ class RaftGPU:
     def _ivf_search_params(self):
         """Build a fresh IVF-PQ SearchParams with sensible defaults."""
         n_probes = int(self._ivf_n_probes or 64)
-        # cuVS Python API: no refinement control in SearchParams
         return self.ivf_pq.SearchParams(n_probes=n_probes)
 
     def _refine_exact(self, Qg, I_cand_cp, k_final: int, *, chunk_queries: int | None = None):
@@ -270,15 +330,12 @@ class RaftGPU:
         Vectorized re-ranking on GPU.
         - For cosine: vectors are L2-normalized; rank by descending dot, output distances as -dot.
         - For L2: use exact squared L2 via norm trick: ||v||^2 + ||q||^2 - 2*q·v.
-        Processes queries in chunks to keep memory bounded.
-        Returns (D_cp, I_cp) for the top-k_final results.
         """
         cp = self._cp
         V = self.dataset_cupy(dtype=cp.float32, ensure_row_major=True)  # (N, D)
         nq, kcand = int(I_cand_cp.shape[0]), int(I_cand_cp.shape[1])
         is_ip = (self._metric_name == "inner_product")
 
-        # Heuristic chunk size to cap working set (~512MB)
         if chunk_queries is None:
             D = int(V.shape[1])
             bytes_per_elem = 4  # float32
@@ -286,29 +343,27 @@ class RaftGPU:
             target = 512 * 1024 * 1024
             chunk_queries = max(1, min(nq, target // max(est, 1)))
 
-        # Precompute norms if L2
         qnorm2 = None
         vnorm2 = None
         if not is_ip:
             if self._row_norm2 is None:
-                self._row_norm2 = cp.sum(V * V, axis=1).astype(cp.float32, copy=False)  # (N,)
+                self._precompute_row_norms()
             vnorm2 = self._row_norm2
-            qnorm2 = cp.sum(Qg * Qg, axis=1).astype(cp.float32, copy=False)             # (nq,)
+            qnorm2 = cp.sum(Qg * Qg, axis=1).astype(cp.float32, copy=False)  # (nq,)
 
         D_out = cp.empty((nq, k_final), dtype=cp.float32)
         I_out = cp.empty((nq, k_final), dtype=I_cand_cp.dtype)
 
         for start in range(0, nq, chunk_queries):
             end = min(start + chunk_queries, nq)
-            Ic = I_cand_cp[start:end]                          # (b, kcand)
-            Qc = Qg[start:end]                                 # (b, D)
+            Ic = I_cand_cp[start:end]  # (b, kcand)
+            Qc = Qg[start:end]  # (b, D)
 
             # Gather candidate vectors -> (b, kcand, D)
             C = V.take(Ic, axis=0)
 
             if is_ip:
-                # sims = einsum('bkd,bd->bk')
-                #sims = cp.einsum('bkd,bd->bk', C, Qc, optimize=True)
+                # sims = einsum('bkd,bd->bk') via batched matmul
                 sims = (Qc[:, None, :] @ C.transpose(0, 2, 1)).squeeze(1)
                 d = -sims
             else:
@@ -316,34 +371,25 @@ class RaftGPU:
                 d = (vnorm2.take(Ic, axis=0) + qnorm2[start:end, None] - 2.0 * sims)  # (b,k)
 
             # Row-wise top-k
-            part = cp.argpartition(d, kth=k_final - 1, axis=1)[:, :k_final]            # (b,k)
-            d_top = cp.take_along_axis(d, part, axis=1)                                # (b,k)
-            order = cp.argsort(d_top, axis=1)                                          # (b,k)
-            idx_top = cp.take_along_axis(part, order, axis=1)                          # (b,k)
+            part = cp.argpartition(d, kth=k_final - 1, axis=1)[:, :k_final]  # (b,k)
+            d_top = cp.take_along_axis(d, part, axis=1)  # (b,k)
+            order = cp.argsort(d_top, axis=1)  # (b,k)
+            idx_top = cp.take_along_axis(part, order, axis=1)  # (b,k)
 
             I_out[start:end] = cp.take_along_axis(Ic, idx_top, axis=1)
             D_out[start:end] = cp.take_along_axis(d, idx_top, axis=1).astype(cp.float32, copy=False)
 
-            # Free big temporaries early
             del C, sims, d, part, d_top, order, idx_top
 
         return D_out, I_out
 
-    def search(
-        self,
-        Q: Any,
-        k: int = 10,
-        *,
-        return_distances: bool = False,  # kept for API compatibility; method always returns (D, I)
-    ):
+    def search(self, Q: Any, k: int = 10):
         """
         Search top-k.
         Returns: (D_cp, I_cp) -> both **CuPy** device arrays
         - D_cp: (nq, k) distances (ascending)
         - I_cp: (nq, k) neighbor row indices
-        Use `decode(I_cp, D_cp)` to map indices back to your `metas`.
         """
-
         if self.index is None:
             raise RuntimeError("Index not built")
 
@@ -352,8 +398,8 @@ class RaftGPU:
         if Qg.shape[1] != self.dim:
             raise ValueError(f"Q has dim={Qg.shape[1]}, expected {self.dim}")
 
-        # Normalize queries for cosine
-        Qg = self._normalize_inplace_if_cosine(Qg)
+        # Normalize queries for cosine (always force normalization for queries)
+        Qg = self._normalize_inplace_if_cosine(Qg, force=True)
 
         n = len(self.metas)
         if n == 0:
@@ -378,43 +424,28 @@ class RaftGPU:
             I_cp = cp.ascontiguousarray(I_cp)
 
         # Optional exact re-ranking for IVF-PQ
-        if self._build_algo == "ivf_pq" and I_cp.shape[1] > k_clamped and (self._refine and self._refinement_rate > 1.0):
+        if self._build_algo == "ivf_pq" and self._refine and I_cp.shape[1] > k_clamped:
             D_cp, I_cp = self._refine_exact(Qg, I_cp, k_clamped)
         else:
-            D_cp = None
-
-        if return_distances:
-            if D_cp is None:
-                D_cp = self._to_cupy_array(d_dev)
-                if I_cp.shape[1] != int(D_cp.shape[1]):
-                    D_cp = D_cp[:, :I_cp.shape[1]]
+            D_cp = self._to_cupy_array(d_dev)
             if not D_cp.flags.c_contiguous:
                 D_cp = cp.ascontiguousarray(D_cp)
 
-        # Ensure we have distances on device and both outputs are contiguous
-        if D_cp is None:
-            D_cp = self._to_cupy_array(d_dev)
-        if not D_cp.flags.c_contiguous:
-            D_cp = cp.ascontiguousarray(D_cp)
-        if not I_cp.flags.c_contiguous:
-            I_cp = cp.ascontiguousarray(I_cp)
+            # Ensure D/I match k_clamped if we fetched k_cand but didn't refine
+            if I_cp.shape[1] != k_clamped:
+                I_cp = I_cp[:, :k_clamped]
+                D_cp = D_cp[:, :k_clamped]
 
-        # cuVS convention: return (distances, neighbors), both device arrays
         return D_cp, I_cp
 
     def decode(self, neighbors, distances=None):
         """
         Map neighbor ids (+ optional distances) into metadata rows.
 
-        Args:
-            neighbors: (nq, k) indices; CuPy or NumPy.
-            distances: optional (nq, k) distances; CuPy or NumPy.
-
         Returns:
-            list over queries -> list over k -> (*meta_tuple, score?, row_idx)
+            list over queries -> list over k -> (meta_obj_or_fields..., score?, row_idx)
         """
         np = self._np
-        # host views for Python-side meta access
         I = np.asarray(neighbors)
         D = np.asarray(distances) if distances is not None else None
 
@@ -426,10 +457,15 @@ class RaftGPU:
                 if idx < 0:
                     continue
                 meta = self.metas[idx]
-                if D is not None:
-                    row.append((*meta, float(D[q, j]), idx))
+                # Preserve old behavior for list/tuple metas; otherwise keep object as a single field
+                if isinstance(meta, (list, tuple)):
+                    meta_fields = tuple(meta)
                 else:
-                    row.append((*meta, idx))
+                    meta_fields = (meta,)
+                if D is not None:
+                    row.append((*meta_fields, float(D[q, j]), idx))
+                else:
+                    row.append((*meta_fields, idx))
             out.append(row)
         return out
 
@@ -440,7 +476,9 @@ class RaftGPU:
         Returns (bytes_or_None, serialized_flag).
         """
         try:
-            ser = getattr(self.cagra, "serialize", None) if self._build_algo == "nn_descent" else getattr(self.ivf_pq, "serialize", None)
+            ser = getattr(self.cagra, "serialize", None) if self._build_algo == "nn_descent" else getattr(
+                self.ivf_pq, "serialize", None
+            )
             if callable(ser):
                 return ser(self.index), True
         except Exception:
@@ -456,13 +494,25 @@ class RaftGPU:
         nbytes = int(X_dev.nbytes)
         buf = alloc_pinned_memory(nbytes)
         host = np.ndarray(X_dev.shape, dtype=X_dev.dtype, buffer=buf)
-        X_dev.get(out=host)   # async copy to pinned; syncs on following CPU use
+        X_dev.get(out=host)  # async copy to pinned; syncs on following CPU use
         return np.asarray(host)
+
+    @staticmethod
+    def configure_memory_pool(*, initial_pool_size: int | None = None) -> None:
+        """
+        Make CuPy use RMM so cuVS and CuPy share the same cudaMallocAsync pool.
+        Call once per process, before any large allocations.
+        """
+        import rmm, cupy as cp
+        rmm.reinitialize(pool_allocator=True, initial_pool_size=initial_pool_size)
+        cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
 
     def enable_memory_pool(self, *, use_rmm: bool = True, initial_pool_size: int | None = None):
         """
         Enable a GPU memory pool to reduce cudaMalloc/cudaFree overhead.
         Call once after constructing the class.
+
+        (Kept for backward compatibility; prefer `configure_memory_pool` at process start.)
         """
         if use_rmm:
             import rmm, cupy as cp
@@ -471,10 +521,11 @@ class RaftGPU:
                 initial_pool_size=initial_pool_size,  # e.g., 8<<30 = 8GB
             )
             cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+            self._using_rmm_allocator = True
         else:
-            # Ensure CuPy's default memory pool is initialized
             import cupy as cp
             _ = cp.get_default_memory_pool()
+            self._using_rmm_allocator = False
 
     def save(
         self,
@@ -486,8 +537,10 @@ class RaftGPU:
         """
         Save index + metas + manifest.
 
-        If this cuVS build doesn't support (de)serialization, a small placeholder
-        index file is written and we persist embeddings so load() can rebuild.
+        Strategy:
+        1) Prefer new path-based `cuvs.neighbors.*.save()` (can embed dataset on device).
+        2) Fallback to bytes-based serialize() -> write as a single index file.
+        3) Persist embeddings **only if needed** for rebuilds (avoid device→host copies otherwise).
         """
         cp = self._cp
         out = Path(out_dir)
@@ -495,20 +548,29 @@ class RaftGPU:
 
         files_dict: dict = {}
         serialized_ok = False
+        used_path_based = False
 
         # Try to save index to file using available API
         index_file = "index.cagra" if self._build_algo == "nn_descent" else "index.ivfpq"
         idx_path = out / index_file
 
-        # Attempt method A: library .save(path, index, include_dataset=...)
         try:
-            if self._build_algo == "nn_descent":
-                self.cagra.save(str(idx_path), self.index, include_dataset=include_dataset)
-            else:
-                self.ivf_pq.save(str(idx_path), self.index, include_dataset=include_dataset)
-            serialized_ok = True
+            # Attempt 1: New path-based save (preferred)
+            saver = getattr(self.cagra, "save", None) if self._build_algo == "nn_descent" else getattr(
+                self.ivf_pq, "save", None
+            )
+            if callable(saver):
+                saver(str(idx_path), self.index, include_dataset=include_dataset)
+                serialized_ok = True
+                used_path_based = True
         except Exception:
-            # Attempt method B: serialize() -> bytes, then write
+            serialized_ok = False
+            used_path_based = False
+            if idx_path.exists():
+                idx_path.unlink()
+
+        # Attempt 2: Older bytes-based serialize()
+        if not serialized_ok:
             try:
                 ser_bytes, ok = self._maybe_serialize_index()
                 if ok and ser_bytes is not None:
@@ -517,46 +579,64 @@ class RaftGPU:
                     serialized_ok = True
             except Exception:
                 serialized_ok = False
+                if idx_path.exists():
+                    idx_path.unlink()
 
         if serialized_ok:
             files_dict["index"] = index_file
 
-        # Metas
+        # Metas (tiny; host write is fine)
         metas_path = out / "metas.json"
         with open(metas_path, "w") as f:
             json.dump(self.metas, f)
         files_dict["metas"] = "metas.json"
 
-        # Persist embeddings to guarantee load() can rebuild when needed
+        # Persist embeddings only if they are needed for a future rebuild:
+        # - If we used path-based save and include_dataset=True, the dataset is embedded: no .npy dump.
+        # - Else, we write embeddings so load() can rebuild.
         fallback_normalized = None
+        need_embeddings_dump = True
+        if used_path_based and include_dataset:
+            need_embeddings_dump = False  # dataset is inside the saved index
 
-        if include_dataset:
-            if self._dataset_cp is None:
-                raise RuntimeError("No in-memory dataset to persist (include_dataset=True).")
-            # Use pinned for potentially faster D2H; fall back to cp.asnumpy if needed
-            try:
-                X_host = self._to_host_pinned(self._dataset_cp)
-            except Exception:
-                X_host = cp.asnumpy(self._dataset_cp)
-            ds_path = out / "dataset_f32.npy"
-            with open(ds_path, "wb") as f:
-                self._np.save(f, X_host)
-            files_dict["dataset_embeddings"] = "dataset_f32.npy"
-        else:
-            if fallback_embeddings is None:
-                raise ValueError("include_dataset=False requires fallback_embeddings")
-            Xg = self._as_device_row_major_f32(fallback_embeddings)
-            if self._metric_name == "inner_product":
-                norms = cp.linalg.norm(Xg, axis=1)
-                fallback_normalized = bool(cp.all(cp.abs(norms - 1.0) < 1e-3).item())
-            try:
-                X_host = self._to_host_pinned(Xg)
-            except Exception:
-                X_host = cp.asnumpy(Xg)
-            fb_path = out / "embeddings_f32.npy"
-            with open(fb_path, "wb") as f:
-                self._np.save(f, X_host)
-            files_dict["fallback_embeddings"] = "embeddings_f32.npy"
+        if need_embeddings_dump:
+            if include_dataset:
+                if self._dataset_cp is None:
+                    raise RuntimeError("No in-memory dataset to persist (include_dataset=True).")
+                try:
+                    X_host = self._to_host_pinned(self._dataset_cp)
+                except Exception:
+                    X_host = cp.asnumpy(self._dataset_cp)
+                ds_path = out / "dataset_f32.npy"
+                with open(ds_path, "wb") as f:
+                    self._np.save(f, X_host)
+                files_dict["dataset_embeddings"] = "dataset_f32.npy"
+            else:
+                if fallback_embeddings is None:
+                    raise ValueError("include_dataset=False requires fallback_embeddings")
+                Xg = self._as_device_row_major_f32(fallback_embeddings)
+                if self._metric_name == "inner_product":
+                    norms = cp.linalg.norm(Xg, axis=1)
+                    fallback_normalized = bool(cp.all(cp.abs(norms - 1.0) < 1e-3).item())
+                try:
+                    X_host = self._to_host_pinned(Xg)
+                except Exception:
+                    X_host = cp.asnumpy(Xg)
+                fb_path = out / "embeddings_f32.npy"
+                with open(fb_path, "wb") as f:
+                    self._np.save(f, X_host)
+                files_dict["fallback_embeddings"] = "embeddings_f32.npy"
+
+            # Save row norms if they exist (for L2 metric) only when we're already dumping arrays.
+            if self._row_norm2 is not None:
+                try:
+                    norms_host = self._to_host_pinned(self._row_norm2)
+                except Exception:
+                    norms_host = cp.asnumpy(self._row_norm2)
+                norms_path = out / "row_norms.npy"
+                with open(norms_path, "wb") as f:
+                    self._np.save(f, norms_host)
+                files_dict["row_norms"] = "row_norms.npy"
 
         # manifest
         manifest = _Manifest(
@@ -582,6 +662,7 @@ class RaftGPU:
             files=files_dict,
             fallback_normalized=fallback_normalized,
             index_serialized=serialized_ok,
+            vectors_normalized=self._vectors_normalized,
         )
         (out / "manifest.json").write_text(json.dumps(asdict(manifest), indent=2))
 
@@ -591,7 +672,14 @@ class RaftGPU:
     @classmethod
     def load(cls, in_dir: str | os.PathLike, metric: str | None = None) -> "RaftGPU":
         import numpy as np
-        """Load an index from a directory created by save()."""
+        """
+        Load an index from a directory created by save().
+
+        Strategy:
+        1) Try path-based `cuvs.neighbors.*.load()` (preferred; can restore dataset inside index).
+        2) Fallback to bytes-based `deserialize()`.
+        3) If neither yields a ready-to-search index+dataset, rebuild from persisted embeddings.
+        """
         in_dir = Path(in_dir)
         manifest_path = in_dir / "manifest.json"
         m = json.loads(manifest_path.read_text())
@@ -609,6 +697,8 @@ class RaftGPU:
                 f"requested='{user_metric}'→'{requested_internal}'"
             )
         include_dataset_saved = bool(m.get("include_dataset", False))
+        vectors_normalized_manifest = bool(m.get("vectors_normalized", False))
+        fallback_normalized_manifest = m.get("fallback_normalized", None)
 
         params = m.get("params", {})
         raft = cls(
@@ -627,41 +717,90 @@ class RaftGPU:
             search_itopk_size=params.get("search_itopk_size", 128),
         )
 
-        # Load metas (required)
+        # Load metas (preserve original types; don't coerce to tuples)
         metas_path = in_dir / files["metas"]
-        raft.metas = [tuple(x) for x in json.loads(metas_path.read_text())]
+        raft.metas = json.loads(metas_path.read_text())
 
         # Try to deserialize the graph index (only if present)
         deserialized = False
         idx_rel = files.get("index")
         if idx_rel:
+            idx_path = in_dir / idx_rel
+
+            # Attempt 1: New path-based load (preferred)
             try:
-                idx_path = in_dir / idx_rel
-                if raft._build_algo == "nn_descent":
-                    raft.index = raft.cagra.deserialize(idx_path)
-                else:
-                    raft.index = raft.ivf_pq.deserialize(idx_path)
-                deserialized = True
+                loader = getattr(raft.cagra, "load", None) if raft._build_algo == "nn_descent" else getattr(
+                    raft.ivf_pq, "load", None
+                )
+                if callable(loader):
+                    raft.index = loader(str(idx_path))
+                    deserialized = True
             except Exception:
                 raft.index = None
                 deserialized = False
 
-        # Case A: index & dataset were saved together → searchable immediately
-        if include_dataset_saved and deserialized:
+            # Attempt 2: Older bytes-based deserialize
+            if not deserialized:
+                try:
+                    with open(idx_path, "rb") as f:
+                        blob = f.read()
+                    deser = getattr(raft.cagra, "deserialize", None) if raft._build_algo == "nn_descent" else getattr(
+                        raft.ivf_pq, "deserialize", None
+                    )
+                    if callable(deser):
+                        raft.index = deser(blob)
+                        deserialized = True
+                except Exception:
+                    raft.index = None
+                    deserialized = False
+
+        # Identify any persisted embeddings on disk (for rebuilds or attach-only scenarios)
+        emb_rel = files.get("dataset_embeddings") or files.get("fallback_embeddings")
+        using_fallback = bool(files.get("fallback_embeddings"))
+        dataset_normalized = (
+            bool(fallback_normalized_manifest)
+            if using_fallback and fallback_normalized_manifest is not None
+            else vectors_normalized_manifest
+        )
+
+        # ---- Case A: index was saved with dataset and path-deserialized successfully ----
+        # Trust the dataset embedded in the index; do NOT force-load a .npy; avoid eager CuPy wrapping.
+        if deserialized and include_dataset_saved:
+            # Leave dataset under cuVS/RMM control; wrap lazily in dataset_cupy() if needed.
+            raft._dataset_cp = None
+            raft._vectors_normalized = vectors_normalized_manifest
+            raft._row_norm2 = None
             return raft
 
-        # Case B: dataset was NOT saved → we must rebuild from embeddings even if
-        # the graph structure deserializes, because CAGRA/IVF-PQ need dataset vectors.
-        emb_rel = files.get("dataset_embeddings") or files.get("fallback_embeddings")
+        # ---- Case B: need to attach embeddings and possibly rebuild ----
         if not emb_rel:
+            # No disk embeddings to rebuild from
+            if deserialized:
+                # Index might still be usable (e.g., CAGRA) without dataset;
+                # we set _dataset_cp=None and allow search (refine disabled)
+                raft._dataset_cp = None
+                raft._row_norm2 = None
+                raft._vectors_normalized = vectors_normalized_manifest
+                return raft
             raise RuntimeError(
                 "Index was saved without dataset and no embeddings are present to rebuild."
             )
-        # Clear any half-loaded index so add() can rebuild fresh
-        raft.index = None
-        if hasattr(raft, "_X_dev"):
-            raft._X_dev = None
 
+        # Load embeddings from disk -> device (only when necessary)
         X_host = np.load(in_dir / emb_rel).astype(np.float32, copy=False)
-        raft.add(X_host, raft.metas)
+        X_dev = raft._as_device_row_major_f32(X_host)
+
+        if deserialized:
+            # We have an index (likely bytes-deserialized) but it doesn't carry dataset.
+            # Attach dataset to this wrapper (for refine/dataset_cupy); no rebuild.
+            raft._dataset_cp = X_dev
+            raft._vectors_normalized = vectors_normalized_manifest if not using_fallback else bool(dataset_normalized)
+            raft._row_norm2 = None  # computed lazily if needed
+            return raft
+
+        # No index -> rebuild from embeddings
+        raft.index = None
+        raft._dataset_cp = None
+        raft._vectors_normalized = False  # will be set by add()
+        raft.add(X_dev, raft.metas, _skip_normalization=bool(dataset_normalized))
         return raft

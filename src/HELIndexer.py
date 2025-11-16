@@ -1,10 +1,11 @@
-# HELIndexer.py
-
+# HELIndexer.py (refactored)
 from __future__ import annotations
 
 import json
 import logging
 from pathlib import Path
+import weakref
+import atexit
 from typing import Iterator, List, Optional, Tuple, Dict, Any
 from collections.abc import Mapping
 from threading import Thread
@@ -21,6 +22,8 @@ except Exception as _e:  # pragma: no cover
 
 from src.configs import IndexConfig
 from src.RaftGPU import RaftGPU
+# NEW: helper encapsulating LUT/IDs logic
+from src.dna_tokenizer import DNATok
 
 
 # ----------------------------- DNA utils -------------------------------------
@@ -38,10 +41,6 @@ def _l2_normalize_rows(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 def _l2_normalize_rows_inplace(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    In-place(ish) row-wise L2 normalization.
-    Keeps x's dtype; uses float32 accumulators for stability when needed.
-    """
     if x.dtype != torch.float32:
         norms = x.float().pow(2).sum(dim=1, keepdim=True).sqrt_().clamp_min_(eps)
         x = x / norms
@@ -58,15 +57,6 @@ def _ensure_dir(p: Path) -> None:
 # -------------------------- Lazy FASTA access --------------------------------
 
 class LazyReferenceDict(Mapping):
-    """
-    Read-only, dict-like access to a FASTA reference via pysam/HTSlib.
-
-    - __getitem__(contig) returns the FULL uppercase sequence for that contig,
-      fetched on demand (no RAM blow-up unless you actually pull large contigs).
-    - .lengths gives {contig: length} without fetching sequences.
-    - Close the underlying handle with .close() if desired (HELIndexer holds one).
-    """
-
     def __init__(self, fasta_path: Path) -> None:
         if pysam is None:
             raise RuntimeError("pysam is required for LazyReferenceDict.")
@@ -98,37 +88,11 @@ class LazyReferenceDict(Mapping):
 
 
 # ----------------------------- HELIndexer ------------------------------------
-
 class HELIndexer:
-    """
-    GPU-first reference window embedder and ANN index builder.
-
-    Lifecycle:
-      1) build_or_load(outdir, reuse_existing=..., include_dataset=...)
-         -> will build if not present or reuse_existing=False
-      2) After build/load, self.raft (RaftGPU) and self.meta are available.
-
-    Parameters
-    ----------
-    ref_fasta : Path
-        Path to the reference FASTA (can be bgzipped and indexed; pysam handles it).
-    cfg : IndexConfig
-        Indexing configuration: .window (int), .stride (int), .rc_index (bool),
-        and optionally .metric ('cosine'|'l2'), .skip_N_frac (float), etc.
-    embedder : str | object
-        If str in {"hyena","nt","det"} it picks a backend. Otherwise any object
-        exposing a) embed_best(List[str]) -> torch.cuda.FloatTensor [B, D],
-        and (optionally) b) embed_tokens(LongTensor[B,T]) -> torch.cuda.FloatTensor [B, D].
-    emb_batch : int
-        Batch size fed into the embedder.
-    device : str
-        'cuda' (default if available) or 'cpu'. Index building requires GPU.
-    logger : logging.Logger | None
-        Optional shared logger. If None, a default logger is created.
-    """
-
-    MANIFEST_NAME = "manifest.json"      # written by RaftGPU.save(...)
-    HEL_META_NAME = "hel_meta.json"      # written by this class
+    MANIFEST_NAME = "manifest.json"
+    HEL_META_NAME = "hel_meta.json"
+    INT32_MAX = 2_147_483_647
+    DEFAULT_IDS_MAX_TOKENS_PER_CALL = 262_144  # 256k
 
     def __init__(
         self,
@@ -142,7 +106,6 @@ class HELIndexer:
         self.ref_fasta = Path(ref_fasta)
         self.cfg = cfg
 
-        # --- pick or accept provided embedder
         if isinstance(embedder, str):
             key = embedder.lower()
             if key == "nt":
@@ -155,7 +118,7 @@ class HELIndexer:
                     model_name=getattr(cfg, "model_name", None),
                     model_dir=getattr(cfg, "model_dir", None),
                     pooling="mean",
-                    normalize=False,    # we normalize here if cosine
+                    normalize=False,
                     offline=True,
                     prefer_cuda=True,
                 )
@@ -173,7 +136,7 @@ class HELIndexer:
                     center_slices=True,
                 )
         else:
-            self.embedder = embedder  # custom object
+            self.embedder = embedder
 
         self.emb_batch = int(emb_batch)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -194,17 +157,14 @@ class HELIndexer:
                 "Please install pysam."
             )
 
-        # Prefer faster matmul/convs on NVIDIA GPUs when possible
         if torch.cuda.is_available():
             try:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.benchmark = True
-                # no-op on older PyTorch; improves perf on newer versions
                 torch.set_float32_matmul_precision("high")
             except Exception:
                 pass
 
-        # runtime fields
         self.raft: Optional[RaftGPU] = None
         self.meta: Dict[str, Any] = {}
         self.dim: Optional[int] = None
@@ -212,24 +172,68 @@ class HELIndexer:
         self.ref_dict = LazyReferenceDict(self.ref_fasta)
         self.contig_lengths: Dict[str, int] = self.ref_dict.lengths
 
-        # ID path wiring (set during _build if available)
-        self._use_ids_path: bool = False
-        self._ascii_lut: Optional[np.ndarray] = None  # shape [256], dtype=np.int64
-        self._id_pad: int = 0
-        self._id_N: int = 0
-        self._token_len: Optional[int] = None  # if embedder needs fixed T
+        self.ids_helper = DNATok(
+            embedder=self.embedder,
+            ids_max_tokens_per_call=int(getattr(self.cfg, "ids_max_tokens_per_call", self.DEFAULT_IDS_MAX_TOKENS_PER_CALL)),
+            logger=self.log,
+        )
+
+        # ensure cleanup runs before modules are torn down
+        wr = weakref.ref(self)
+        def _cleanup(ref=wr):
+            obj = ref()
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        atexit.register(_cleanup)
+
+    # Context manager support
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """Release GPU/extern resources early to avoid noisy __dealloc__ at shutdown."""
+        try:
+            if hasattr(self, "raft") and self.raft is not None:
+                raft = self.raft
+                # try common close/free/destroy names without changing behavior if absent
+                for m in ("close", "destroy", "free", "release"):
+                    fn = getattr(raft, m, None)
+                    if callable(fn):
+                        try:
+                            fn()
+                        except Exception:
+                            pass
+                self.raft = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "ref_dict") and self.ref_dict is not None:
+                self.ref_dict.close()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     # --------------------------- helpers -------------------------------------
 
     def _cfg_or(self, name: str, default):
-        """Like getattr but stable for optional config fields."""
         return getattr(self.cfg, name, default)
 
     def _metric_and_norm(self) -> Tuple[str, bool]:
-        """
-        Decide metric ('cosine' or 'l2') and whether we should L2 normalize.
-        Default to 'cosine' if cfg.metric absent. Return (metric, do_norm).
-        """
         metric = str(getattr(self.cfg, "metric", "cosine")).lower()
         if metric not in ("cosine", "l2"):
             self.log.warning("Unknown metric '%s'; defaulting to 'cosine'.", metric)
@@ -255,7 +259,7 @@ class HELIndexer:
             if S > 0:
                 n = 1 + (L - W) // S
             else:
-                n = 1  # stride==0 -> single window at position 0
+                n = 1
             total += n
         if rc:
             total *= 2
@@ -264,16 +268,10 @@ class HELIndexer:
     def _iter_windows(
         self, ff: pysam.FastaFile, contigs: List[Tuple[str, int]]
     ) -> Iterator[Tuple[str, int, str, int]]:
-        """
-        Yield (chrom, start, seq, strand_sign) for each window.
-        strand_sign: +1 for forward, -1 for reverse-complement (when rc_index=True)
-
-        NOTE: Kept for compatibility. See _iter_windows_fast for optimized path.
-        """
         W = int(self.cfg.window)
         S = int(self.cfg.stride)
         rc = bool(getattr(self.cfg, "rc_index", True))
-        skip_N_frac = float(getattr(self.cfg, "skip_N_frac", 1.0))  # 1.0 => keep all
+        skip_N_frac = float(getattr(self.cfg, "skip_N_frac", 1.0))
 
         for chrom, clen in contigs:
             if clen < W:
@@ -297,18 +295,9 @@ class HELIndexer:
                 if rc:
                     yield chrom, start, revcomp(seq), -1
 
-    # ---------------------- Optimized window iterator -------------------------
-
     def _iter_windows_fast(
         self, ff: pysam.FastaFile, contigs: List[Tuple[str, int]]
     ) -> Iterator[Tuple[str, int, str, int]]:
-        """
-        Optimized iterator:
-          - fetch each contig once
-          - optional O(1) N-fraction filtering via cumulative counts
-          - precompute reverse-complement once per contig
-        Yields the same tuples as _iter_windows.
-        """
         W = int(self.cfg.window)
         S = int(self.cfg.stride)
         rc = bool(getattr(self.cfg, "rc_index", True))
@@ -318,13 +307,9 @@ class HELIndexer:
             if clen < W:
                 continue
 
-            # Fetch the whole contig once
             s = ff.fetch(chrom, 0, clen).upper()
-
-            # Precompute RC sequence once per contig if needed
             rc_s = revcomp(s) if rc else None
 
-            # Optional cumulative N counts for O(1) in-window N fraction evaluation
             use_n_filter = (skip_N_frac < 1.0)
             if use_n_filter:
                 n_cum = np.zeros(clen + 1, dtype=np.int32)
@@ -346,20 +331,13 @@ class HELIndexer:
                     if (n_in_win / float(W)) > skip_N_frac:
                         continue
 
-                # forward strand
                 yield chrom, start, s[start:start + W], +1
 
                 if rc:
-                    # reverse-complement window slice:
-                    # RC(s[start:start+W]) == rc_s[clen-(start+W): clen-start]
                     rc_start = clen - (start + W)
                     yield chrom, start, rc_s[rc_start:rc_start + W], -1
 
     def _first_dim_probe(self, batch: List[str]) -> int:
-        """
-        Run a tiny probe batch through the embedder to learn D.
-        Assumes embedder returns torch.cuda.FloatTensor [B, D].
-        """
         x = self.embedder.embed_best(batch)  # [B, D] on CUDA
         if not (isinstance(x, torch.Tensor) and x.is_cuda and x.ndim == 2):
             raise TypeError("embedder.embed_best must return CUDA tensor [B, D]")
@@ -367,204 +345,70 @@ class HELIndexer:
         del x
         return D
 
-    # ---------------------- IDs path (tokenizer) ------------------------------
-
-    def _discover_ids_capability(self) -> None:
-        """
-        Detect whether the embedder exposes an IDs path and construct
-        a fast ASCII->id LUT if we can discover a compatible vocabulary.
-
-        We consider the IDs path available if:
-          - hasattr(embedder, 'embed_tokens')  (callable)
-        and we can pick pad_id & N_id. We do *not* depend on special tokens.
-        """
-        embed_tokens = getattr(self.embedder, "embed_tokens", None)
-        if not callable(embed_tokens):
-            self._use_ids_path = False
-            return
-
-        # Discover mapping for DNA alphabet and PAD/N
-        # Strategy:
-        #   1) Query common attributes on embedder/tokenizer for pad id and per-char ids
-        #   2) Else, build a fallback mapping {A,C,G,T,N} -> {1,2,3,4,0} with pad=0
-        #      and warn once (still safe for models that treat unknowns uniformly)
-        pad_id = None
-        n_id = None
-        char_to_id: Dict[str, int] = {}
-
-        # Direct hints
-        for name in ("pad_id", "pad_token_id"):
-            v = getattr(self.embedder, name, None)
-            if isinstance(v, int):
-                pad_id = v
-                break
-        # Tokenizer hints
-        tok = getattr(self.embedder, "tokenizer", None)
-        if tok is not None:
-            v = getattr(tok, "pad_token_id", None)
-            if isinstance(v, int):
-                pad_id = pad_id if pad_id is not None else v
-            # Vocab dict
-            get_vocab = getattr(tok, "get_vocab", None)
-            vocab = None
-            if callable(get_vocab):
-                try:
-                    vocab = get_vocab()
-                except Exception:
-                    vocab = None
-            elif hasattr(tok, "vocab"):
-                vocab = getattr(tok, "vocab", None)
-            if isinstance(vocab, dict):
-                # Try simple 1-char tokens
-                for ch in ("A", "C", "G", "T", "N"):
-                    if ch in vocab and isinstance(vocab[ch], int):
-                        char_to_id[ch] = int(vocab[ch])
-
-        # Embedder-side helpers
-        for helper in ("token_to_id", "id_for_token"):
-            fn = getattr(self.embedder, helper, None)
-            if callable(fn):
-                for ch in ("A", "C", "G", "T", "N"):
-                    try:
-                        v = fn(ch)
-                        if isinstance(v, int):
-                            char_to_id[ch] = int(v)
-                    except Exception:
-                        pass
-
-        # Heuristic fallback if still missing
-        if not char_to_id:
-            # Common compact mapping; models often reserve 0 for PAD
-            char_to_id = {"A": 1, "C": 2, "G": 3, "T": 4, "N": 0}
-            if pad_id is None:
-                pad_id = 0
-            n_id = char_to_id["N"]
-            self.log.warning(
-                "IDs path: using fallback DNA vocab {A:1,C:2,G:3,T:4,N:0}, pad=%d. "
-                "If your model expects different ids, expose embedder.token_to_id() "
-                "or tokenizer vocab.", pad_id
-            )
-        else:
-            # Prefer explicit N if present; else map unknowns to PAD
-            n_id = char_to_id.get("N", pad_id if pad_id is not None else 0)
-            if pad_id is None:
-                # Try common pad tokens
-                for t in ("<pad>", "[PAD]", "PAD", "pad"):
-                    if tok is not None and hasattr(tok, "convert_tokens_to_ids"):
-                        try:
-                            pid = tok.convert_tokens_to_ids(t)
-                            if isinstance(pid, int) and pid >= 0:
-                                pad_id = pid
-                                break
-                        except Exception:
-                            pass
-                if pad_id is None:
-                    pad_id = 0  # last resort
-
-        # Build ASCII LUT (uint16 -> int64 later). Map everything unknown to N (or PAD).
-        lut = np.full(256, n_id if n_id is not None else pad_id, dtype=np.int64)
-        for ch, idx in char_to_id.items():
-            lut[ord(ch)] = int(idx)
-            lc = ch.lower()
-            if len(lc) == 1 and lc != ch:
-                lut[ord(lc)] = int(idx)
-
-        self._ascii_lut = lut
-        self._id_pad = int(pad_id)
-        self._id_N = int(n_id if n_id is not None else pad_id)
-        # Optional fixed token length hint
-        for name in ("model_max_length", "max_position_embeddings", "max_seq_len"):
-            v = getattr(self.embedder, name, None)
-            if isinstance(v, int) and v > 0:
-                self._token_len = v
-                break
-
-        self._use_ids_path = True
-        self.log.info("IDs path enabled (embed_tokens): PAD=%d, N=%d", self._id_pad, self._id_N)
-
-    @staticmethod
-    def _encode_batch_ascii_lut(seqs: List[str], lut: np.ndarray) -> np.ndarray:
-        """
-        Vectorized ASCII->id encoding using a prebuilt LUT.
-        Assumes all seqs have equal length T and contain ASCII chars.
-        Returns np.ndarray [B, T] (int64).
-        """
-        assert len(seqs) > 0
-        T = len(seqs[0])
-        # Safety: ensure equal lengths
-        for s in seqs:
-            if len(s) != T:
-                raise ValueError("All sequences in a batch must have equal length.")
-        # Build a single bytes buffer, then reshape
-        buf = ("".join(seqs)).encode("ascii", errors="ignore")
-        arr = np.frombuffer(buf, dtype=np.uint8)
-        if arr.size != len(seqs) * T:
-            # Fallback if non-ASCII leaked in
-            arr = np.empty((len(seqs), T), dtype=np.uint8)
-            for i, s in enumerate(seqs):
-                arr[i, :] = np.frombuffer(s.encode("ascii", errors="replace"), dtype=np.uint8)[:T]
-        else:
-            arr = arr.reshape(len(seqs), T)
-        return lut[arr]  # [B, T], int64
-
     # --------------------------- Public API ----------------------------------
 
     def build_or_load(
-        self,
-        outdir: Path,
-        reuse_existing: bool = True,
-        include_dataset: bool = True,
-        verbose: bool = True,
+            self,
+            outdir: Path,
+            reuse_existing: bool = True,
+            include_dataset: bool = True,
+            verbose: bool = True,
     ) -> None:
-        """
-        Build the ANN index (and save) or load an existing one from outdir.
-
-        Parameters
-        ----------
-        outdir : Path
-            Directory where index and metadata will be saved or loaded from.
-        reuse_existing : bool
-            If True and an existing manifest is present, load instead of rebuilding.
-        include_dataset : bool
-            Pass-through to RaftGPU.save(include_dataset=...). If False, RaftGPU
-            will omit dataset persistence (useful for very large corpora).
-        verbose : bool
-            Extra log lines.
-        """
         outdir = Path(outdir)
         _ensure_dir(outdir)
 
         manifest_path = outdir / self.MANIFEST_NAME
         hel_meta_path = outdir / self.HEL_META_NAME
 
+        current_metric, _ = self._metric_and_norm()
+
         if reuse_existing and manifest_path.exists() and hel_meta_path.exists():
+            with open(hel_meta_path) as f:
+                on_disk = json.load(f)
+
+            if on_disk.get("window") != int(self.cfg.window):
+                if verbose:
+                    self.log.warning("Window size mismatch (disk=%s, cfg=%s). Rebuilding.",
+                                     on_disk.get("window"), int(self.cfg.window))
+                self._build(outdir, include_dataset, verbose)
+                return
+
+            if on_disk.get("stride") != int(self.cfg.stride):
+                if verbose:
+                    self.log.warning("Stride mismatch (disk=%s, cfg=%s). Rebuilding.",
+                                     on_disk.get("stride"), int(self.cfg.stride))
+                self._build(outdir, include_dataset, verbose)
+                return
+
+            if on_disk.get("metric") != current_metric:
+                if verbose:
+                    self.log.warning("Metric mismatch (disk=%s, cfg=%s). Rebuilding.",
+                                     on_disk.get("metric"), current_metric)
+                self._build(outdir, include_dataset, verbose)
+                return
+
             if verbose:
                 self.log.info("Loading existing index from %s ...", str(outdir))
-            self._load(outdir)
+            self.raft = RaftGPU.load(outdir, metric=current_metric)
+            self.dim = self.raft.dim
+            self.meta = on_disk
             return
 
         if verbose:
             self.log.info("Rebuilding at %s ...", str(outdir))
-
-        # Build fresh
         with torch.inference_mode():
             self._build(outdir=outdir, include_dataset=include_dataset, verbose=verbose)
 
     # --------------------------- Internals -----------------------------------
 
     def _raft_params(self) -> Dict[str, Any]:
-        """
-        Collect RaftGPU/ANN parameters from cfg with safe defaults.
-        (RaftGPU will clamp small-N cases internally; warnings may appear, which is fine.)
-        """
         return {
             "build_algo":          self._cfg_or("build_algo", "nn_descent"),
-            "graph_degree":        int(self._cfg_or("graph_degree", 128)),
-            "intermediate_graph_degree": int(self._cfg_or("intermediate_graph_degree", 192)),
+            "graph_degree":        int(self._cfg_or("graph_degree", 64)),
+            "intermediate_graph_degree": int(self._cfg_or("intermediate_graph_degree", 64)),
             "nn_descent_niter":    int(self._cfg_or("nn_descent_niter", 10)),
             "refinement_rate":     float(self._cfg_or("refinement_rate", 2.0)),
             "search_itopk_size":   int(self._cfg_or("search_itopk_size", 128)),
-            # IVF/PQ (optional)
             "ivf_n_lists":         self._cfg_or("ivf_n_lists", None),
             "ivf_n_probes":        self._cfg_or("ivf_n_probes", None),
             "ivf_pq_dim":          self._cfg_or("ivf_pq_dim", None),
@@ -572,10 +416,6 @@ class HELIndexer:
         }
 
     def _autotune_batch(self, probe: List[str], start: int, max_factor: int = 64) -> int:
-        """
-        Very small helper to ramp batch size to better saturate the GPU.
-        Returns a batch size >= start, backing off safely on OOM.
-        """
         bs = max(1, int(start))
         limit = start * max_factor
         while bs <= limit:
@@ -583,7 +423,6 @@ class HELIndexer:
                 tmp = [probe[0]] * bs
                 with torch.amp.autocast("cuda", dtype=torch.float16, enabled=True):
                     out = self.embedder.embed_best(tmp, rc_invariant=False)
-                # synchronize to ensure allocation actually happened
                 torch.cuda.synchronize()
                 bs *= 2
             except RuntimeError as e:
@@ -619,7 +458,7 @@ class HELIndexer:
             D = self._first_dim_probe(probe_batch)
             self.dim = D
 
-            # ---- Optional batch autotune (conservative) ----
+            # ---- Optional batch autotune ----
             try:
                 tuned = self._autotune_batch(probe_batch, start=self.emb_batch)
                 if tuned != self.emb_batch:
@@ -635,21 +474,19 @@ class HELIndexer:
             if total_windows <= 0:
                 raise RuntimeError("No windows available for the given window/stride settings.")
 
-            # IDs capability (ASCII LUT, PAD/N)
-            self._discover_ids_capability()
+            # NEW: discover IDs capability (LUT, PAD/N, token_len)
+            self.ids_helper.discover()
 
             self.log.info(
                 "Embedding (GPU streaming, batch=%d, ids_path=%s) ... total windows=%d, dim=%d",
-                self.emb_batch, str(self._use_ids_path), total_windows, D
+                self.emb_batch, str(self.ids_helper.use_ids_path), total_windows, D
             )
 
-            # Single large device buffer in fp32 (cuVS requires fp32)
             X = torch.empty((total_windows, D), device="cuda", dtype=torch.float32)
             metas: List[Tuple[str, int, int]] = []
             metas_extend = metas.extend
 
             # ---------------- Producer: CPU side ----------------
-            from queue import Queue
             q: Queue = Queue(maxsize=64)
 
             def _batch_producer():
@@ -660,34 +497,16 @@ class HELIndexer:
                     seqs.append(seq)
                     metas_local.append((chrom, start, strand))
                     if len(seqs) >= self.emb_batch:
-                        if self._use_ids_path and self._ascii_lut is not None:
-                            ids_np = self._encode_batch_ascii_lut(seqs, self._ascii_lut)
-                            if self._token_len is not None and self._token_len > ids_np.shape[1]:
-                                pad = self._token_len - ids_np.shape[1]
-                                # left-pad (matches existing behavior)
-                                ids_np = np.pad(ids_np, ((0, 0), (pad, 0)), constant_values=self._id_pad)
-                            ids_cpu = torch.as_tensor(ids_np, dtype=torch.long)
-                            try:
-                                ids_cpu = ids_cpu.pin_memory()
-                            except Exception:
-                                pass
+                        if self.ids_helper.use_ids_path:
+                            ids_cpu = self.ids_helper.encode_batch_to_ids(seqs)
                             q.put(("ids", ids_cpu, metas_local))
                         else:
                             q.put(("seqs", list(seqs), metas_local))
                         seqs, metas_local = [], []
 
-                # tail
                 if seqs:
-                    if self._use_ids_path and self._ascii_lut is not None:
-                        ids_np = self._encode_batch_ascii_lut(seqs, self._ascii_lut)
-                        if self._token_len is not None and self._token_len > ids_np.shape[1]:
-                            pad = self._token_len - ids_np.shape[1]
-                            ids_np = np.pad(ids_np, ((0, 0), (pad, 0)), constant_values=self._id_pad)
-                        ids_cpu = torch.as_tensor(ids_np, dtype=torch.long)
-                        try:
-                            ids_cpu = ids_cpu.pin_memory()
-                        except Exception:
-                            pass
+                    if self.ids_helper.use_ids_path:
+                        ids_cpu = self.ids_helper.encode_batch_to_ids(seqs)
                         q.put(("ids", ids_cpu, metas_local))
                     else:
                         q.put(("seqs", list(seqs), metas_local))
@@ -697,75 +516,42 @@ class HELIndexer:
             producer = Thread(target=_batch_producer, daemon=True)
             producer.start()
 
-            # ---------------- Consumer: GPU side with prefetch ----------------
-            copy_stream = torch.cuda.Stream()
-            compute_stream = torch.cuda.current_stream()
-
             pos = 0
-            pending = None  # (kind, payload_gpu_or_list, metas, copy_event)
-
-            def _prefetch(item):
-                kind, payload, metas_batch = item
-                if kind == "ids":
-                    # Begin HtoD on a separate stream
-                    with torch.cuda.stream(copy_stream):
-                        ids_dev = payload.to(device="cuda", non_blocking=True)
-                        ev = torch.cuda.Event()
-                        ev.record(copy_stream)
-                    return ("ids", ids_dev, metas_batch, ev)
-                else:
-                    # Nothing to pre-copy for raw seqs
-                    return ("seqs", payload, metas_batch, None)
-
-            # Prime the pipeline
             item = q.get()
-            if item[0] == "done":
-                pending = None
-            else:
-                pending = _prefetch(item)
+            pending = None if item[0] == "done" else item
 
             while pending is not None:
-                # Start prefetch for the next batch (if any) before computing current
                 nxt = q.get()
-                next_prefetched = None if nxt[0] == "done" else _prefetch(nxt)
+                next_pending = None if nxt[0] == "done" else nxt
 
-                kind, payload_dev_or_list, metas_batch, ev = pending
+                kind, payload, metas_batch = pending
 
-                # Ensure any pending copy completed before we use the buffer
-                if ev is not None:
-                    compute_stream.wait_event(ev)
-
-                # Run embed on the compute stream
                 if kind == "ids":
-                    with torch.cuda.stream(compute_stream), torch.amp.autocast("cuda", dtype=torch.float16,
-                                                                               enabled=True):
-                        xb = self.embedder.embed_tokens(payload_dev_or_list, rc_invariant=False)  # [B, D] CUDA
+                    for xb in self.ids_helper.iter_embed_tokens_in_slices(payload, emb_batch=self.emb_batch, device="cuda"):
+                        bsz = int(xb.shape[0])
+                        X[pos:pos + bsz].copy_(xb)
+                        pos += bsz
+                    metas_extend(metas_batch)
                 else:
-                    batch_seqs = payload_dev_or_list  # List[str]
-                    with torch.cuda.stream(compute_stream), torch.amp.autocast("cuda", dtype=torch.float16,
-                                                                               enabled=True):
+                    batch_seqs = payload  # List[str]
+                    with torch.amp.autocast("cuda", dtype=torch.float16, enabled=True):
                         xb = self.embedder.embed_best(batch_seqs, rc_invariant=False)
+                    if xb.device.type != "cuda":
+                        xb = xb.to(device="cuda", non_blocking=True)
+                    if xb.dtype != torch.float32:
+                        xb = xb.float()
+                    bsz = int(xb.shape[0])
+                    X[pos:pos + bsz].copy_(xb)
+                    metas_extend(metas_batch)
+                    pos += bsz
 
-                if xb.device.type != "cuda":
-                    xb = xb.to(device="cuda", non_blocking=True)
-                if xb.dtype != torch.float32:
-                    xb = xb.float()
+                pending = next_pending
 
-                bsz = int(xb.shape[0])
-                X[pos:pos + bsz].copy_(xb)  # device→device; stays on default stream
-                metas_extend(metas_batch)
-                pos += bsz
-
-                # Advance
-                pending = next_prefetched
-
-            # Adjust for potential N-filtered drops
             if pos != total_windows:
                 X = X[:pos]
             N = int(X.shape[0])
             assert X.shape[1] == D
 
-            # ---------------- Build ANN (cuVS) ----------------
             self.log.info(
                 "Building ANN (CAGRA/RAFT): N=%d, dim=%d, algo=%s ...",
                 N, D, raft_kwargs.get("build_algo", "nn_descent")
@@ -785,20 +571,16 @@ class HELIndexer:
                 ivf_pq_bits=raft_kwargs["ivf_pq_bits"],
             )
 
-            # Size RMM pool to CURRENT free memory, not total
             try:
                 free_bytes, total_bytes = torch.cuda.mem_get_info()
-                # keep some headroom for temporary kernels & stream syncs
                 pool = int(free_bytes * 0.85)
                 raft.enable_memory_pool(use_rmm=True, initial_pool_size=pool)
                 self.log.info("RMM pool initialized to %.2f GB of free VRAM", pool / (1024 ** 3))
             except Exception:
                 pass
 
-            # Add (zero-copy via DLPack inside RaftGPU) and persist
             raft.add(X, metas)
 
-            # Release Torch handle; dataset now lives in cuVS/CuPy
             try:
                 del X
                 torch.cuda.empty_cache()
@@ -807,9 +589,8 @@ class HELIndexer:
 
             _ensure_dir(outdir)
             self.log.info("Saving to %s (include_dataset=%s) ...", str(outdir), str(include_dataset))
-            manifest = raft.save(outdir, include_dataset=include_dataset)
+            manifest = raft.save(outdir)
 
-            # HEL-side metadata
             hel_meta = {
                 "schema": "hel-indexer-v1",
                 "created_by": "HELIndexer",
@@ -824,8 +605,8 @@ class HELIndexer:
                 "embedder_name": getattr(self.embedder, "name", type(self.embedder).__name__),
                 "embedding_dim": D,
                 "n_vectors": N,
-                "ids_path": bool(self._use_ids_path),
-                "token_len_fixed": self._token_len,
+                "ids_path": bool(self.ids_helper.use_ids_path),
+                "token_len_fixed": self.ids_helper.token_len,
                 "contigs": [{"name": ctg, "length": length} for ctg, length in contigs],
                 "raft_params": raft_kwargs,
                 "raft_manifest_file": self.MANIFEST_NAME,

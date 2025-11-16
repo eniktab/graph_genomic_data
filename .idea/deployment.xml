@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="en9803@gadi-compute:22 password (2)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="en9803@gadi-compute:22 password (3)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="en9803@gadi-compute:22 password">
@@ -11,6 +11,13 @@
         </serverdata>
       </paths>
       <paths name="en9803@gadi-compute:22 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/g/data/te53/en9803/workspace/sync/ANU/graph_genomic_data" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="en9803@gadi-compute:22 password (3)">
         <serverdata>
           <mappings>
             <mapping deploy="/g/data/te53/en9803/workspace/sync/ANU/graph_genomic_data" local="$PROJECT_DIR$" />

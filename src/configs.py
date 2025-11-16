@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple
+import logging
 
 # ------------------------------
 # IndexConfig & HELIndexer
@@ -9,6 +10,7 @@ class IndexConfig:
     # --- reference chunking / embeddings ---
     window: int = 10_000
     stride: int = 2_500
+    ids_max_tokens_per_call: int = 262_144
     rc_index: bool = True
     model_name: str = "hyenadna-large-1m-seqlen-hf"
     model_dir: str = "/g/data/te53/en9803/data/scratch/hf-cache/models/"

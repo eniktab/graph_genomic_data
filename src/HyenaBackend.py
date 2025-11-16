@@ -728,6 +728,7 @@ class HyenaFilter(OptimModule):
             bias=True,
             num_inner_mlps=2,
             normalized=False,
+            train_freq=True,
             **kwargs
     ):
         """
@@ -750,7 +751,7 @@ class HyenaFilter(OptimModule):
         self.bias = nn.Parameter(torch.randn(self.d_model))
         self.dropout = nn.Dropout(dropout)
 
-        act = Sin(dim=order, w=w)
+        act = Sin(dim=order, w=w, train_freq=train_freq)
         self.emb_dim = emb_dim
         assert emb_dim % 2 != 0 and emb_dim >= 3, "emb_dim must be odd and greater or equal to 3 (time, sine and cosine)"
         self.seq_len = seq_len
@@ -1169,6 +1170,34 @@ class HyenaDNAHF(nn.Module):
                 )
             layer['l_max'] = l_max
 
+        # --- INFER HYENA FILTER HYPERPARAMS FROM CHECKPOINT (emb_dim, filter_order) ---
+        # Load once here so we can peek at shapes; we reuse it for grafting below.
+        pretrained_sd = cls._load_pretrained_dict(weight_path, map_location=device)
+
+        # Find the first-layer implicit MLP input weight; its shape is [order, emb_dim].
+        suffix = "backbone.layers.0.mixer.filter_fn.implicit_filter.0.weight"
+        roots = ["", "model.", "hyena.", "hyena.model.", "hyenadna.", "hyenadna.model."]
+
+        found_key = None
+        for r in roots:
+            k = f"{r}{suffix}"
+            if k in pretrained_sd:
+                found_key = k
+                break
+
+        if found_key is not None:
+            w0 = pretrained_sd[found_key]
+            # For Linear(out_features, in_features): weight.shape == (out_features, in_features)
+            filter_order_inferred = int(w0.shape[0])   # 'order' (width) of the implicit MLP
+            emb_dim_inferred     = int(w0.shape[1])    # positional-embedding channel dimension
+
+            # Only set if missing in the config
+            layer.setdefault("filter_order", filter_order_inferred)
+            layer.setdefault("emb_dim", emb_dim_inferred)
+        else:
+            # If a snapshot uses an unusual prefix, proceed with cfg values.
+            pass
+
         checkpointing = cls._detect_checkpointing_from_config(cfg)
 
         # Build user scratch model
@@ -1184,7 +1213,7 @@ class HyenaDNAHF(nn.Module):
         scratch.to(device)
 
         # Load and graft pretrained tensors
-        pretrained_sd = cls._load_pretrained_dict(weight_path, map_location=device)
+        # Load and graft pretrained tensors (we already loaded pretrained_sd above)
         merged = cls._graft_backbone(
             scratch.state_dict(),
             pretrained_sd,
@@ -1301,6 +1330,19 @@ class HyenaDNAHF(nn.Module):
             if checkpointing:
                 bases |= {inject_layer(b) for b in list(bases)}
 
+            m = re.search(r"implicit_filter\.(\d+)\.freq$", skey)
+            if m:
+                idx = m.group(1)
+                cluster = ("1", "3", "5")
+                if idx in cluster:
+                    for alt in cluster:
+                        bases.add(
+                            skey.replace(
+                                f".implicit_filter.{idx}.freq",
+                                f".implicit_filter.{alt}.freq"
+                            )
+                        )
+
             # Embedding + final norm synonyms (kept minimal; adjust if you meet other snapshots)
             if skey.endswith("embeddings.word_embeddings.weight"):
                 bases |= {"embed_tokens.weight", "wte.weight",
@@ -1332,7 +1374,7 @@ class HyenaDNAHF(nn.Module):
         if verbose:
             print(f"[hyena] grafted backbone: {hits} params; missing: {len(misses)}")
             if strict and misses:
-                for k in misses[:20]:
+                for k in misses:
                     print("  miss:", k)
 
         if strict and misses:
@@ -1478,10 +1520,10 @@ class HyenaDNAPooler:
         *,
         # ---- config (defaults = clustering winner family) ----
         direction: str = "exp_left",
-        tau: float = 64.0,
+        tau: float = 40.0,
         head_k: Optional[int] = None,
         tail_k: Optional[int] = None,
-        pooling_axis: str = "position",
+        pooling_axis: str = "position→layers",
         layer_spec: Union[int, Tuple[str, int]] = -7,
         channel_groups: Optional[int] = None, # required for channel pooling axes
         rc_average: bool = False,
@@ -1562,8 +1604,8 @@ class HyenaDNAPooler:
         preset = preset.lower()
         if preset == "cluster_max_sep":
             return cls(backend,
-                       direction="exp_left", tau=56.0,
-                       pooling_axis="position", layer_spec=-7,
+                       direction="exp_right", tau=40.0,
+                       pooling_axis="position→layers", layer_spec=-7,
                        rc_average=False)
         elif preset == "balanced_rc":
             return cls(backend,
@@ -2505,7 +2547,7 @@ class HyenaBackend:
         Defaults = best from your benchmark:
           direction='exp_left', tau=64.0, pooling_axis='position', layer_spec=-7, rc_average=False
         """
-        defaults = dict(direction="exp_left", tau=64.0, pooling_axis="position", layer_spec=-7, rc_average=False)
+        defaults = dict(direction="exp_right", tau=40.0, pooling_axis="position→layers", layer_spec=-7, rc_average=False)
         defaults.update(kwargs or {})
         return HyenaDNAPooler(self, **defaults)
 
